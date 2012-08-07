@@ -52,6 +52,16 @@ Games::TMX::Parser - parse tiled game maps from http://www.mapeditor.org
     $cell        = $cell->below;
     $cell        = $cell->seek_next_cell; # follow a path of tiled cells on a layer
 
+    # ----- objects -------------------
+    $og          = $map->get_objectgroup('some_objectgroup');
+    @obj_names   = $og->list_object_names;  # ('rect1', 'my_polygon2')
+    $obj_rect1   = $og->get_objects_by_name('rect1')->[0];  # name is neither required
+                                                            # nor required to be unique
+                                                            # so it's an array
+    $obj_rect1->positions_yx; # [ [0,0], [0,1], [1,1], [1,1] ]
+    @objs_at_pos = $og->objects_for_position_yx(0, 1) # ( $obj_rect1 )
+
+
 =head1 DESCRIPTION
 
 From http://www.mapeditor.org:
@@ -106,7 +116,13 @@ for any map with a simple path drawn on it.
 No support for base64 or compression of maps, uncheck the correct check boxes
 in Tiled before you save.
 
-No support for object layers.
+Object support is very simple. All you can do right now is introspect positions of
+objects.
+
+Fill algorithm for polygon objects breaks for complex polygons
+
+Objects can be larger than the map (which isn't agains the law, but an optional
+warning might be useful)
 
 =head1 DEVELOPMENT
 
@@ -114,10 +130,10 @@ Send pull requests to:
 
     https://github.com/eilara/Games-TMX-Parser
 
-
 =head1 AUTHOR
 
 Ran Eilam <eilara@cpan.org>
+Konstantin Baierer <kba@cpan.org>
 
 A big hug to mst for namespacing help.
 
@@ -174,7 +190,7 @@ use Moose;
 
 extends 'Games::TMX::Parser::MapElement';
 
-has [qw(layers tilesets width height tile_width tile_height tiles_by_id)] =>
+has [qw(layers objectgroups tilesets width height tile_width tile_height tiles_by_id)] =>
     (is => 'ro', lazy_build => 1);
 
 sub _build_layers {
@@ -182,6 +198,13 @@ sub _build_layers {
     return {map { $_->att('name') =>
         Games::TMX::Parser::Layer->new(el => $_, map => $self)
     } $self->children('layer') };
+}
+
+sub _build_objectgroups {
+    my $self = shift;
+    return {map { $_->att('name') =>
+        Games::TMX::Parser::ObjectGroup->new(el => $_, map => $self)
+    } $self->children('objectgroup') };
 }
 
 sub _build_tiles_by_id {
@@ -199,10 +222,11 @@ sub _build_tilesets {
 
 sub _build_width       { shift->att('width') }
 sub _build_height      { shift->att('height') }
-sub _build_tile_width  { shift->att('tile_width') }
-sub _build_tile_height { shift->att('tile_height') }
+sub _build_tile_width  { shift->att('tilewidth') }
+sub _build_tile_height { shift->att('tileheight') }
 
 sub get_layer { shift->layers->{pop()} }
+sub get_objectgroup { shift->objectgroups->{pop()} }
 sub get_tile  { shift->tiles_by_id->{pop()} }
 
 # ------------------------------------------------------------------------------
@@ -371,5 +395,309 @@ sub seek_next_cell {
     }
     return undef;
 }
+
+1;
+
+# ------------------------------------------------------------------------------
+
+package Games::TMX::Parser::ObjectGroup;
+
+use Moose;
+use List::MoreUtils qw(natatime);
+
+extends 'Games::TMX::Parser::MapElement';
+
+has map => (is => 'ro', required => 1, weak_ref => 1, handles => [qw(
+    width height tile_width tile_height get_tile
+)]);
+
+has objects => (
+    is        => 'rw',
+    isa       => 'ArrayRef[Games::TMX::Parser::Object]',
+    traits    => ['Array'],
+    handles => {
+        add_object => 'push',
+        list_objects => 'elements',
+        grep_objects => 'grep',
+        map_objects => 'map',
+    },
+    lazy_build => 1,
+);
+
+sub list_object_names {
+    my $self = shift;
+    my @names = $self->map_objects(sub{$_->name});
+    return wantarray ? @names : \@names;
+}
+
+sub get_objects_by_name {
+    my $self = shift;
+    my $name = shift;
+    my @objects = $self->grep_objects(sub{$_->name && $_->name eq $name});
+    return wantarray ? @objects : \@objects;
+}
+
+sub _build_objects {
+    my $self = shift;
+    my @objects;
+    my ($y, $x, $w, $h);
+    for my $el ($self->children('object') ) {
+        my $object_type;
+
+        # determine object type
+        if ($el->att('width')) {
+            $object_type = 'Rectangle';
+        }
+        elsif ($el->att('gid')) {
+            $object_type = 'Tile';
+        }
+        elsif (scalar $el->children('polygon')) {
+            $object_type = 'Polygon';
+        }
+        elsif (scalar $el->children('polyline')) {
+            $object_type = 'Polyline';
+        }
+        unless ($object_type && $object_type =~ m/^(?: Rectangle | Tile | Polyline | Polygon )$/x) {
+            warn "This object type [$object_type] isn't implemented yet.";
+            next;
+        };
+        my $obj_pkg = "Games::TMX::Parser::Object::$object_type";
+        my %new_args = (
+            el          => $el,
+            x           => $el->att('x'),
+            y           => $el->att('y'),
+            objectgroup => $self,
+        );
+        $new_args{name} = $el->att('name') if $el->att('name');
+        push @objects, $obj_pkg->new( %new_args );
+    }
+    return \@objects;
+}
+
+sub objects_for_position_yx {
+    my $self = shift;
+    my ($y, $x) = @_;
+    my @objects;
+    for my $obj ($self->list_objects) {
+        if ($obj->grep_positions_yx(sub { $_->[0] == $y && $_->[1] == $x })) {
+            push @objects, $obj;
+            next;
+        };
+    }
+    return \@objects;
+}
+
+1;
+
+# ------------------------------------------------------------------------------
+
+package Games::TMX::Parser::Object;
+
+use Moose;
+
+extends 'Games::TMX::Parser::MapElement';
+
+has [qw(x y)] => (is => 'ro', isa => 'Int', required => 1);
+
+has name => (is => 'rw', isa => 'Str');
+
+has positions_yx => (
+    is         => 'ro',
+    isa        => 'ArrayRef[ArrayRef[Int]]',
+    lazy_build => 1,
+    traits     => ['Array'],
+    handles => {
+        'grep_positions_yx' => 'grep',
+    },
+);
+
+has objectgroup => (is => 'ro', isa => 'Games::TMX::Parser::ObjectGroup', required => 1);
+
+sub xy { ($_[0]->x, $_[0]->y) }
+
+sub dump_object {
+    my $self = shift;
+    my @dump;
+    for my $y (0..$self->objectgroup->height) {
+        for my $x (0..$self->objectgroup->width) {
+            $dump[$y]->[$x] = ".";
+        }
+    }
+    for (@{$self->positions_yx}) {
+        $dump[$_->[0]]->[$_->[1]]  = '#';
+    }
+    my $out = "";
+    map {$out .= join("", @$_) . "\n"} @dump;
+    return $out;
+}
+
+1;
+
+# ------------------------------------------------------------------------------
+
+package Games::TMX::Parser::Object::Rectangle;
+
+use Moose;
+
+extends 'Games::TMX::Parser::Object';
+
+has [qw(width height)] => (is => 'ro', isa => 'Int', required => 1);
+
+around BUILDARGS => sub {
+    my $orig  = shift;
+    my $class = shift;
+    my %args = @_;
+    $args{width}  = $args{el}->att('width');
+    $args{height} = $args{el}->att('height');
+    return $class->$orig(%args);
+};
+
+sub _build_positions_yx {
+    my $self = shift;
+    my @positions;
+    my $tile_height = $self->objectgroup->tile_height;
+    my $tile_width = $self->objectgroup->tile_width;
+    my $y_tile = ($self->y / $tile_height);
+    my $x_tile = ($self->x / $tile_width);
+    my $y_tile_max = ($y_tile + $self->width / $tile_height - 1);
+    my $x_tile_max = ($x_tile + $self->height / $tile_width - 1);
+    for (my $y = $y_tile; $y <= $y_tile_max; $y++) {
+        for (my $x = $x_tile; $x <= $x_tile_max; $x++) {
+            push @positions, [ $y, $x ];
+        }
+    }
+    return \@positions;
+}
+
+# ------------------------------------------------------------------------------
+
+package Games::TMX::Parser::Object::Tile;
+
+use Moose;
+
+extends 'Games::TMX::Parser::Object';
+
+has tile => (is => 'ro', required => 1);
+
+around BUILDARGS => sub {
+    my $orig  = shift;
+    my $class = shift;
+    my %args = @_;
+    $args{tile}  = $args{objectgroup}->map->get_tile($args{el}->att('gid'));
+    return $class->$orig(%args);
+};
+
+sub _build_positions_yx {
+    my $self = shift;
+    return [[$self->y/$self->objectgroup->tile_height - 1, $self->x / $self->objectgroup->tile_width]];
+}
+
+1;
+
+# ------------------------------------------------------------------------------
+
+package Games::TMX::Parser::Object::Polyline;
+
+use Moose;
+use Algorithm::Line::Bresenham;
+
+extends 'Games::TMX::Parser::Object';
+
+has points => (is => 'ro', isa => 'ArrayRef[ArrayRef[Int]]', required => 1 );
+
+sub el_name {'polyline'};
+
+around BUILDARGS => sub {
+    my $orig  = shift;
+    my $class = shift;
+    my %args = @_;
+    my $i = 0;
+    my @points_raw = map {[reverse split /,/, "$_"]} split /\s+/, $args{el}->first_child($class->el_name)->att('points');
+    my @points = map {[ $_->[0] + $args{y} , $_->[1] + $args{x}]} @points_raw;
+    $args{points} = \@points;
+    return $class->$orig(%args);
+};
+
+
+sub _build_positions_yx {
+    my $self = shift;
+    my %positions_hash;
+
+    my $tile_height = $self->objectgroup->tile_height;
+    my $tile_width = $self->objectgroup->tile_width;
+
+    # draw polyline
+    my @points = map { [ $_->[0] / $tile_height, $_->[1] / $tile_width ] } @{ $self->points };
+    my $start_point = shift @points;
+    for my $end_point (@points) {
+        my @positions_line = Algorithm::Line::Bresenham::line(@$start_point, @$end_point);
+        # hack to remove duplicates
+        map {$positions_hash{join ",", @$_} = $_} @positions_line;
+        $start_point = $end_point;
+    }
+
+    # return [sort {$a->[0] <=> $b->[0] || $a->[1] <=> $b->[1]} values %positions_hash];
+    return [values %positions_hash];
+}
+
+1;
+
+# ------------------------------------------------------------------------------
+
+package Games::TMX::Parser::Object::Polygon;
+
+use Moose;
+
+extends 'Games::TMX::Parser::Object::Polyline';
+
+sub el_name {'polygon'};
+
+sub BUILD {
+    my $self = shift;
+
+    # close the polygon
+    push @{ $self->points }, $self->points->[0];
+}
+
+around _build_positions_yx => sub {
+    my $orig  = shift;
+    my $self = shift;
+    my @outline_points = @{$self->$orig()};
+    my @fill_points;
+
+    # TODO this breaks for more complex polygons, probably because
+    # of the fill_flag thingy. Have to investigate
+    # do scan line fill 
+    my $max_y = 0;
+    my $max_x = 0;
+    map { 
+        $max_y = $_->[0] > $max_y ? $_->[0] : $max_y;
+        $max_x = $_->[1] > $max_x ? $_->[1] : $max_x 
+    } @{ $self->points };
+
+    my $y_end = $max_y / $self->objectgroup->tile_height;
+    my $y_start = $self->y / $self->objectgroup->tile_height;
+    my $x_end = $max_x / $self->objectgroup->tile_width;
+    my $x_start = $self->x / $self->objectgroup->tile_width;
+
+    for my $y (reverse($y_start .. $y_end)) {
+        my $fill_flag = 0;
+        my $fill_flag_before = 0;
+        for my $x ($x_start .. $x_end) {
+            if ( 
+                grep( { $_->[0] == $y && $_->[1] == $x } @outline_points )
+                && ! $fill_flag_before
+            ) {
+                $fill_flag = not $fill_flag;
+            }
+            if ($fill_flag) {
+                push @fill_points, [$y, $x];
+            }
+            $fill_flag_before = $fill_flag;
+        }
+    }
+
+    return [@outline_points, @fill_points];
+};
 
 1;
