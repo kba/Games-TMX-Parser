@@ -169,7 +169,7 @@ sub _build_twig {
 
 sub _build_map {
     my $self = shift;
-    return Games::TMX::Parser::Map->new(el => $self->twig->root);
+    return Games::TMX::Parser::Map->new(el => $self->twig->root, parser => $self);
 }
 
 # ------------------------------------------------------------------------------
@@ -178,8 +178,10 @@ package Games::TMX::Parser::MapElement;
 
 use Moose;
 
-has el => (is => 'ro', required => 1, handles => [qw(
-    att att_exists first_child children print
+has parser => ( is => 'ro' );
+
+has el => (is => 'rw', required => 1, handles => [qw(
+    att att_exists first_child children print replace replace_with
 )]);
 
 # ------------------------------------------------------------------------------
@@ -216,7 +218,7 @@ sub _build_tiles_by_id {
 sub _build_tilesets {
     my $self = shift;
     return [map {
-        Games::TMX::Parser::TileSet->new(el => $_)
+        Games::TMX::Parser::TileSet->new(el => $_, map => $self)
     } $self->children('tileset') ];
 }
 
@@ -235,15 +237,30 @@ package Games::TMX::Parser::TileSet;
 
 use Moose;
 use List::MoreUtils qw(natatime);
+use Data::Dumper;
 
 extends 'Games::TMX::Parser::MapElement';
 
-has [qw(first_gid image tiles width height tile_width tile_height tile_count)] =>
+has [qw(first_gid image tiles width height tile_width tile_height tile_count map)] =>
     (is => 'ro', lazy_build => 1);
 
 sub _build_tiles {
     my $self = shift;
     my $first_gid = $self->first_gid;
+    
+    if (my $tsx_file = $self->att("source")) {
+#        warn "External tilesets (TSX) not implemented yet.";
+        my $tsx_twig = XML::Twig->new;
+        $tsx_twig->parsefile( File::Spec->catfile($self->map->parser->map_dir, $tsx_file) );
+        # TODO
+        # warn Dumper $self->el;
+#        $self->el->print;
+#        $tsx_twig->children('tileset')->print;
+        $self->el( $tsx_twig->children('tileset') );
+#        $self->el->print;
+        # warn Dumper $self->el;
+        # return [];
+    }
 
     # index tiles with properties
     my $prop_tiles = {map {

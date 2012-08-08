@@ -42,11 +42,11 @@ Requires
 
 - Moose
 - XML::Twig
+- Algorithm::Line::Bresenham
 
 
 Not Implemented
 ---------------
 
+- no support for TSX
 - no support for base64 or compression of maps, uncheck the correct check boxes in Tiled before you save
-- no support for object layers
-
